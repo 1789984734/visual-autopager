@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.5.0
+// @version      1.5.1
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -22,6 +22,7 @@
   if (window.top !== window.self || document.getElementById('vap-ui-host')) return;
 
   const STORE = 'visual-autopager.rules.v1';
+  const RECYCLE_INTERVAL = 200;
   const LABELS = { idle: '自动加载中', loading: '正在加载', paused: '已暂停', error: '加载失败', done: '已结束' };
   let engine = null;
   let needsRefresh = false;
@@ -460,6 +461,8 @@
       this.spacer = null;
       this.spacerHeight = 0;
       this.recycleFrame = null;
+      this.recycleTimer = null;
+      this.lastRecycleAt = -Infinity;
       this.recycleListening = false;
       this.recycleBlocked = false;
       this.recycleNote = '';
@@ -489,15 +492,30 @@
       document.removeEventListener('scroll', this.recycleHandler, true);
       window.removeEventListener('resize', this.recycleHandler);
       if (this.recycleFrame !== null) cancelAnimationFrame(this.recycleFrame);
+      if (this.recycleTimer !== null) clearTimeout(this.recycleTimer);
       this.recycleFrame = null;
+      this.recycleTimer = null;
+      this.lastRecycleAt = -Infinity;
       this.recycleListening = false;
     }
 
     scheduleRecycle() {
-      if (!this.recycleListening || this.disposed || needsRefresh || this.recycleBlocked || this.pages.length <= this.rule.retainedPages || this.recycleFrame !== null) return;
+      if (!this.recycleListening || this.disposed || needsRefresh || this.recycleBlocked || this.pages.length <= this.rule.retainedPages || this.recycleFrame !== null || this.recycleTimer !== null) return;
+      const delay = RECYCLE_INTERVAL - (performance.now() - this.lastRecycleAt);
+      // Keep one trailing check without a recurring timer or postponing it on every scroll.
+      if (delay > 0) {
+        this.recycleTimer = setTimeout(() => {
+          this.recycleTimer = null;
+          this.scheduleRecycle();
+        }, delay);
+        return;
+      }
       this.recycleFrame = requestAnimationFrame(() => {
         this.recycleFrame = null;
-        if (!this.disposed) this.recycleOldPages();
+        if (!this.disposed) {
+          this.lastRecycleAt = performance.now();
+          this.recycleOldPages();
+        }
       });
     }
 
@@ -792,15 +810,20 @@
     }
   }
 
+  function setUIProperty(id, property, value) {
+    const element = $(id);
+    if (element[property] !== value) element[property] = value;
+  }
+
   function renderStatus(pager = engine) {
-    if (!ui) return;
-    $('state').textContent = pager ? `${LABELS[pager.state]} · ${pager.pageCount} 页${pager.rule.recyclePages ? ` · 保留 ${pager.pages.length} 页` : ''}` : startupError ? '规则需要调整' : '尚未配置';
-    $('status-detail').textContent = needsRefresh ? '新规则已保存，请刷新页面后应用。' : [pager?.detail || startupError || '配置后可自动追加下一页内容。', pager?.recycleNote].filter(Boolean).join('\n');
-    $('toggle').disabled = !pager || pager.state === 'done' || needsRefresh;
-    $('toggle').textContent = !pager ? '开始自动加载' : ['idle', 'loading'].includes(pager.state) ? '暂停自动加载' : '继续自动加载';
-    $('load').disabled = !pager || pager.busy || pager.state === 'done' || needsRefresh;
-    $('load').textContent = pager?.state === 'error' ? '重试下一页' : '加载下一页';
-    $('refresh').hidden = !needsRefresh;
+    if (!ui || !host.isConnected || $('panel').hidden) return;
+    setUIProperty('state', 'textContent', pager ? `${LABELS[pager.state]} · ${pager.pageCount} 页${pager.rule.recyclePages ? ` · 保留 ${pager.pages.length} 页` : ''}` : startupError ? '规则需要调整' : '尚未配置');
+    setUIProperty('status-detail', 'textContent', needsRefresh ? '新规则已保存，请刷新页面后应用。' : [pager?.detail || startupError || '配置后可自动追加下一页内容。', pager?.recycleNote].filter(Boolean).join('\n'));
+    setUIProperty('toggle', 'disabled', !pager || pager.state === 'done' || needsRefresh);
+    setUIProperty('toggle', 'textContent', !pager ? '开始自动加载' : ['idle', 'loading'].includes(pager.state) ? '暂停自动加载' : '继续自动加载');
+    setUIProperty('load', 'disabled', !pager || pager.busy || pager.state === 'done' || needsRefresh);
+    setUIProperty('load', 'textContent', pager?.state === 'error' ? '重试下一页' : '加载下一页');
+    setUIProperty('refresh', 'hidden', !needsRefresh);
   }
 
   function openPanel() {
@@ -1004,6 +1027,7 @@
     document.removeEventListener('scroll', pickerScroll, true);
     window.removeEventListener('resize', pickerScroll);
     $('pickbar').hidden = true; $('outline').hidden = true; $('panel').hidden = false;
+    renderStatus();
   }
   function confirmPicker() {
     if (!picker?.locked || !picker.selector) return;
