@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.4.1
+// @version      1.5.0
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -105,8 +105,11 @@
           <p class="muted">适用于当前页及追加条目的网页链接；锚点、下载和分页链接保留原行为。</p>
           <details><summary>加载设置</summary>
             <label class="field"><span>提前加载距离（px）</span><input id="preload" type="number" value="800" min="0" max="4000" step="100"></label>
-            <label class="field"><span>最多显示页数（含当前页）</span><input id="maxPages" type="number" value="30" min="2" max="200"></label>
+            <label class="field"><span>累计加载页数上限（含当前页）</span><input id="maxPages" type="number" value="30" min="2" max="200"></label>
             <label class="check"><input id="dedupe" type="checkbox" checked>跳过重复条目</label>
+            <label class="check"><input id="recyclePages" type="checkbox">回收离开视口的旧页（不恢复）</label>
+            <label class="field"><span>最多保留内容页数</span><input id="retainedPages" type="number" value="10" min="1" max="50" disabled></label>
+            <p class="muted">旧内容移出 DOM 后不再恢复。占位保持滚动高度，正在阅读的内容会优先保留。</p>
           </details>
           <div class="actions"><button id="check">高亮检查</button><button id="test">检查下一页</button><button id="save" class="primary">保存规则</button><button id="delete" class="danger" disabled>删除规则</button></div>
           <p id="notice" role="status" aria-live="polite"></p>
@@ -163,6 +166,8 @@
       container: string('container'), items: string('items'), next: string('next'),
       enabled: raw.enabled !== false, auto: raw.auto !== false, dedupe: raw.dedupe !== false,
       openInNewTab: raw.openInNewTab === true,
+      recyclePages: raw.recyclePages === true,
+      retainedPages: raw.retainedPages === undefined ? 10 : number('retainedPages', 1, 50),
       preload: number('preload', 0, 4000), maxPages: number('maxPages', 2, 200),
       updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : Date.now(),
     };
@@ -235,7 +240,7 @@
       if (!anchor || anchor.toLowerCase() === 'top') return true;
       let name;
       try { name = decodeURIComponent(anchor); } catch { return false; }
-      return Boolean(document.getElementById(name)) || [...document.getElementsByName(name)].some((el) => el.localName === 'a');
+      return Boolean(document.getElementById(name)) || engine?.discardedAnchors.has(name) || [...document.getElementsByName(name)].some((el) => el.localName === 'a');
     };
     // Preserve known document anchors; unknown hashes may belong to a site router.
     return pageAnchor(oldFragment) && pageAnchor(newFragment);
@@ -255,6 +260,9 @@
     for (const key of ['container', 'items', 'next']) $(key).value = rule?.[key] || '';
     for (const key of ['enabled', 'auto', 'dedupe']) $(key).checked = rule?.[key] !== false;
     $('openInNewTab').checked = rule?.openInNewTab === true;
+    $('recyclePages').checked = rule?.recyclePages === true;
+    $('retainedPages').value = rule?.retainedPages ?? 10;
+    $('retainedPages').disabled = !$('recyclePages').checked;
     $('preload').value = rule?.preload ?? 800;
     $('maxPages').value = rule?.maxPages ?? 30;
   }
@@ -266,6 +274,7 @@
       container: $('container').value, items: $('items').value, next: $('next').value,
       enabled: $('enabled').checked, auto: $('auto').checked, dedupe: $('dedupe').checked,
       openInNewTab: $('openInNewTab').checked,
+      recyclePages: $('recyclePages').checked, retainedPages: Number($('retainedPages').value),
       preload: Number($('preload').value), maxPages: Number($('maxPages').value), updatedAt: Date.now(),
     });
   }
@@ -275,7 +284,7 @@
     if (containers.length !== 1) throw new Error(`内容容器匹配了 ${containers.length} 个元素，应恰好匹配 1 个。`);
     const container = containers[0];
     if (['HTML', 'BODY'].includes(container.tagName)) throw new Error('请选择列表的内容容器，不要选择整个页面。');
-    const items = [...container.querySelectorAll(rule.items)];
+    const items = [...container.querySelectorAll(rule.items)].filter((el) => !el.hasAttribute('data-vap-spacer'));
     if (!items.length) throw new Error('没有匹配到内容条目，请调整条目范围。');
     const set = new Set(items);
     if (items.some((item) => {
@@ -445,12 +454,193 @@
       this.busy = false;
       this.disposed = false;
       this.originalLinkAttributes = new Map();
+      this.pages = rule.recyclePages ? [{ number: 1, nodes: [...items], keys: new Set(this.seenItems) }] : [];
+      this.discardedAnchors = new Set();
+      this.removedPages = 0;
+      this.spacer = null;
+      this.spacerHeight = 0;
+      this.recycleFrame = null;
+      this.recycleListening = false;
+      this.recycleBlocked = false;
+      this.recycleNote = '';
+      this.originalListStart = this.container.localName === 'ol' ? this.container.getAttribute('start') : null;
+      this.removedItems = 0;
+      this.recycleHandler = () => this.scheduleRecycle();
       this.syncItemLinks(items);
+      this.configureRecycling();
       this.notify();
       if (rule.auto && this.next) this.resume();
     }
 
     notify() { if (!this.disposed) renderStatus(this); }
+
+    configureRecycling() {
+      this.stopRecycling();
+      this.recycleBlocked = false;
+      this.recycleNote = '';
+      if (!this.rule.recyclePages || !this.rule.enabled || this.disposed) return;
+      document.addEventListener('scroll', this.recycleHandler, { capture: true, passive: true });
+      window.addEventListener('resize', this.recycleHandler, { passive: true });
+      this.recycleListening = true;
+      this.scheduleRecycle();
+    }
+
+    stopRecycling() {
+      document.removeEventListener('scroll', this.recycleHandler, true);
+      window.removeEventListener('resize', this.recycleHandler);
+      if (this.recycleFrame !== null) cancelAnimationFrame(this.recycleFrame);
+      this.recycleFrame = null;
+      this.recycleListening = false;
+    }
+
+    scheduleRecycle() {
+      if (!this.recycleListening || this.disposed || needsRefresh || this.recycleBlocked || this.pages.length <= this.rule.retainedPages || this.recycleFrame !== null) return;
+      this.recycleFrame = requestAnimationFrame(() => {
+        this.recycleFrame = null;
+        if (!this.disposed) this.recycleOldPages();
+      });
+    }
+
+    blockRecycling(reason) {
+      this.recycleBlocked = true;
+      this.recycleNote = reason;
+      this.stopRecycling();
+      this.notify();
+    }
+
+    createSpacer(before, height) {
+      const tag = this.container.localName;
+      const spacer = document.createElement(['tbody', 'thead', 'tfoot'].includes(tag) ? 'tr' : ['ul', 'ol'].includes(tag) ? 'li' : 'div');
+      spacer.setAttribute('data-vap-spacer', '');
+      spacer.setAttribute('aria-hidden', 'true');
+      spacer.style.cssText = 'display:block!important;box-sizing:border-box!important;margin:0!important;padding:0!important;border:0!important;min-height:0!important;max-height:none!important;flex:0 0 auto!important;grid-column:1 / -1!important;list-style:none!important;visibility:hidden!important;pointer-events:none!important;';
+      if (spacer.localName === 'tr') {
+        spacer.style.setProperty('display', 'table-row', 'important');
+        const cell = document.createElement('td');
+        cell.colSpan = Math.max(1, [...before.cells].reduce((sum, el) => sum + el.colSpan, 0));
+        cell.style.cssText = 'box-sizing:border-box!important;padding:0!important;border:0!important;line-height:0!important;min-height:0!important;';
+        spacer.append(cell);
+      }
+      this.container.insertBefore(spacer, before);
+      this.spacer = spacer;
+      this.setSpacerHeight(height);
+    }
+
+    setSpacerHeight(height) {
+      this.spacerHeight = Math.max(0, height);
+      this.spacer.style.setProperty('height', `${this.spacerHeight}px`, 'important');
+      if (this.spacer.firstElementChild) this.spacer.firstElementChild.style.setProperty('height', `${this.spacerHeight}px`, 'important');
+    }
+
+    recycleOldPages() {
+      if (!this.rule.recyclePages || !this.rule.enabled || needsRefresh || this.pages.length <= this.rule.retainedPages || this.disposed) return;
+      if (!this.container.isConnected) return this.blockRecycling('内容容器已变化，旧页回收已暂停。');
+      if (this.container.localName === 'ol' && this.container.hasAttribute('reversed')) return this.blockRecycling('倒序列表暂不支持旧页回收。');
+      const style = getComputedStyle(this.container);
+      if ((style.display === 'flex' && style.flexDirection !== 'column') || Number.parseInt(style.columnCount, 10) > 1 || style.columnWidth !== 'auto') return this.blockRecycling('当前横向或分栏布局暂不支持安全回收。');
+      const root = scrollRoot(this.container);
+      const rootRect = root?.getBoundingClientRect();
+      const top = root ? Math.max(0, rootRect.top + root.clientTop) : 0;
+      const bottom = root ? Math.min(innerHeight, rootRect.top + root.clientTop + root.clientHeight) : innerHeight;
+      if (bottom <= top) return;
+      const excess = this.pages.length - this.rule.retainedPages;
+      const grid = style.display.includes('grid');
+      let cut = 0;
+      let firstRect;
+      let oldBottom = -Infinity;
+      for (let index = 0; index < this.pages.length - 1; index++) {
+        const page = this.pages[index];
+        if (page.nodes.some((node) => node.parentElement !== this.container)) return this.blockRecycling('条目需为容器的直接子元素，旧页回收已暂停。');
+        const rects = page.nodes.map((node) => node.getBoundingClientRect());
+        firstRect ||= rects[0];
+        oldBottom = Math.max(oldBottom, ...rects.map((rect) => rect.bottom));
+        // Keep a small reading buffer and never remove a page still on screen.
+        if (oldBottom >= top - 100) break;
+        if (index + 1 < excess) continue;
+        const next = this.pages[index + 1].nodes[0];
+        const nextRect = next.getBoundingClientRect();
+        // For grids, discard complete row groups, even if that leaves fewer pages.
+        if (grid && (Math.abs(nextRect.left - firstRect.left) > 2 || nextRect.top < oldBottom - 2)) continue;
+        cut = index + 1;
+        break;
+      }
+      if (!cut) {
+        this.recycleNote = '等待旧页完全离开视口或形成完整行组后回收。';
+        this.notify();
+        return;
+      }
+      const retiring = this.pages.slice(0, cut);
+      const nodes = retiring.flatMap((page) => page.nodes);
+      if (nodes.some((node) => [node, ...node.querySelectorAll('*')].some((el) => el.localName.includes('-') && customElements.get(el.localName)))) return this.blockRecycling('自定义组件暂不支持自动回收。');
+      const anchor = this.pages[cut].nodes[0];
+      const anchorBefore = anchor.getBoundingClientRect();
+      const lastBefore = this.last.getBoundingClientRect();
+      const scrollNode = root || document.scrollingElement;
+      const oldScroll = scrollNode.scrollTop;
+      const containerRect = this.container.getBoundingClientRect();
+      const scale = this.container.offsetHeight ? containerRect.height / this.container.offsetHeight : 1;
+      const rootScale = root?.offsetHeight ? rootRect.height / root.offsetHeight : 1;
+      const oldHeight = this.spacerHeight;
+      const hadSpacer = Boolean(this.spacer);
+      const positions = nodes.map((node) => ({ node, next: node.nextSibling }));
+      const overflowValue = this.container.style.getPropertyValue('overflow-anchor');
+      const overflowPriority = this.container.style.getPropertyPriority('overflow-anchor');
+      const estimate = Math.max(0, (anchorBefore.top - firstRect.top) / (scale || 1));
+      let accepted = false;
+      const rollback = () => {
+        if (!hadSpacer) { this.spacer?.remove(); this.spacer = null; this.spacerHeight = 0; }
+        else this.setSpacerHeight(oldHeight);
+        for (const { node, next } of [...positions].reverse()) this.container.insertBefore(node, next?.parentNode === this.container ? next : null);
+        scrollNode.scrollTop = oldScroll;
+      };
+      this.container.style.setProperty('overflow-anchor', 'none', 'important');
+      try {
+        if (!this.spacer) this.createSpacer(nodes[0], oldHeight + estimate);
+        else this.setSpacerHeight(oldHeight + estimate);
+        nodes.forEach((node) => node.remove());
+        for (let pass = 0; pass < 3; pass++) {
+          const after = anchor.getBoundingClientRect();
+          const correction = (anchorBefore.top - after.top - (scrollNode.scrollTop - oldScroll) * rootScale) / (scale || 1);
+          if (Math.abs(correction) <= 0.5) break;
+          this.setSpacerHeight(this.spacerHeight + correction);
+        }
+        scrollNode.scrollTop = oldScroll;
+        const after = anchor.getBoundingClientRect();
+        const lastAfter = this.last.getBoundingClientRect();
+        accepted = Math.abs(after.top - anchorBefore.top) <= 2 && Math.abs(after.left - anchorBefore.left) <= 2
+          && Math.abs(scrollNode.scrollTop - oldScroll) <= 2 && Math.abs(lastAfter.top - lastBefore.top) <= 2 && Math.abs(lastAfter.left - lastBefore.left) <= 2;
+        if (!accepted) rollback();
+      } catch {
+        rollback();
+      } finally {
+        if (overflowValue) this.container.style.setProperty('overflow-anchor', overflowValue, overflowPriority);
+        else this.container.style.removeProperty('overflow-anchor');
+      }
+      if (!accepted) return this.blockRecycling('当前布局无法保持滚动位置，已恢复内容并暂停旧页回收。');
+      const includes = (target) => target && nodes.some((node) => node === target || node.contains(target));
+      if (picker && [picker.candidate, picker.hoverTarget, picker.pendingTarget, picker.selectorElement].some(includes)) cancelPicker();
+      if (highlighted.some(({ el }) => includes(el))) clearHighlights();
+      for (const page of retiring) {
+        for (const node of page.nodes) {
+          for (const el of [node, ...node.querySelectorAll('[id],a[name]')]) {
+            if (el.id) this.discardedAnchors.add(el.id);
+            if (el.localName === 'a' && el.getAttribute('name')) this.discardedAnchors.add(el.getAttribute('name'));
+          }
+          if (node.localName === 'a') this.originalLinkAttributes.delete(node);
+          node.querySelectorAll('a').forEach((link) => this.originalLinkAttributes.delete(link));
+        }
+        page.keys.forEach((key) => this.seenItems.delete(key));
+        page.nodes.length = 0;
+        page.keys.clear();
+      }
+      this.pages.splice(0, cut);
+      this.removedPages += cut;
+      this.removedItems += nodes.length;
+      if (this.container.localName === 'ol') this.container.start = (this.originalListStart === null ? 1 : Number(this.originalListStart)) + this.removedItems - 1;
+      this.spacer.dataset.vapRemovedPages = String(this.removedPages);
+      this.recycleNote = `已回收 ${this.removedPages} 页旧内容，不再恢复。`;
+      this.notify();
+    }
 
     restoreItemLink(link) {
       const original = this.originalLinkAttributes.get(link);
@@ -473,6 +663,7 @@
       const pagination = [...document.querySelectorAll(this.rule.next)];
       const links = new Set();
       for (const item of items || this.container.querySelectorAll(this.rule.items)) {
+        if (item.hasAttribute('data-vap-spacer')) continue;
         if (item.matches('a[href]')) links.add(item);
         item.querySelectorAll('a[href]').forEach((link) => links.add(link));
       }
@@ -525,7 +716,17 @@
       this.state = 'done'; this.detail = detail; this.observer?.disconnect(); this.notify();
     }
 
-    destroy() { this.disposed = true; this.observer?.disconnect(); this.controller?.abort(); this.restoreItemLinks(); }
+    destroy() {
+      this.disposed = true; this.observer?.disconnect(); this.controller?.abort();
+      this.stopRecycling(); this.restoreItemLinks();
+      this.pages.forEach((page) => { page.nodes.length = 0; page.keys.clear(); });
+      this.pages.length = 0; this.seenItems.clear(); this.seenPages.clear(); this.discardedAnchors.clear();
+      this.spacer?.remove(); this.spacer = null;
+      if (this.container.localName === 'ol') {
+        if (this.originalListStart === null) this.container.removeAttribute('start');
+        else this.container.setAttribute('start', this.originalListStart);
+      }
+    }
 
     async load(manual = true) {
       if (this.busy || this.disposed || needsRefresh || this.state === 'done' || (!manual && this.state !== 'idle')) return;
@@ -568,6 +769,7 @@
         this.seenPages.add(this.next); this.seenPages.add(result.url);
         pendingKeys.forEach((key) => this.seenItems.add(key));
         this.pageCount++;
+        if (this.rule.recyclePages) this.pages.push({ number: this.pageCount, nodes: [...nodes], keys: pendingKeys });
         this.source = result.url; this.next = next;
         if (!next) this.finish('已加载到最后一页。');
         else if (this.seenPages.has(next)) this.finish('下一页指向已加载页面，已停止。');
@@ -585,15 +787,15 @@
         clearTimeout(timeout);
         if (this.controller === controller) this.controller = null;
         this.busy = false;
-        if (!this.disposed) { this.notify(); this.arm(); }
+        if (!this.disposed) { this.notify(); this.arm(); this.scheduleRecycle(); }
       }
     }
   }
 
   function renderStatus(pager = engine) {
     if (!ui) return;
-    $('state').textContent = pager ? `${LABELS[pager.state]} · ${pager.pageCount} 页` : startupError ? '规则需要调整' : '尚未配置';
-    $('status-detail').textContent = needsRefresh ? '新规则已保存，请刷新页面后应用。' : pager?.detail || startupError || '配置后可自动追加下一页内容。';
+    $('state').textContent = pager ? `${LABELS[pager.state]} · ${pager.pageCount} 页${pager.rule.recyclePages ? ` · 保留 ${pager.pages.length} 页` : ''}` : startupError ? '规则需要调整' : '尚未配置';
+    $('status-detail').textContent = needsRefresh ? '新规则已保存，请刷新页面后应用。' : [pager?.detail || startupError || '配置后可自动追加下一页内容。', pager?.recycleNote].filter(Boolean).join('\n');
     $('toggle').disabled = !pager || pager.state === 'done' || needsRefresh;
     $('toggle').textContent = !pager ? '开始自动加载' : ['idle', 'loading'].includes(pager.state) ? '暂停自动加载' : '继续自动加载';
     $('load').disabled = !pager || pager.busy || pager.state === 'done' || needsRefresh;
@@ -853,12 +1055,13 @@
   function applyRule(rule) {
     if (needsRefresh) { engine?.pause('请刷新后应用新规则。'); renderStatus(); return; }
     if (engine?.pageCount > 1) {
-      const same = ['origin', 'container', 'items', 'next', 'dedupe'].every((key) => engine.rule[key] === rule[key]);
+      const same = ['origin', 'container', 'items', 'next', 'dedupe', 'recyclePages'].every((key) => engine.rule[key] === rule[key]);
       if (!same) {
         engine.pause('规则已变更。'); needsRefresh = true; renderStatus(); return;
       }
       engine.rule = rule;
       engine.syncItemLinks();
+      engine.configureRecycling();
       if (!rule.enabled || !rule.auto || !wildcard(rule.path, location.pathname)) engine.pause('规则已保存，自动加载已暂停。');
       else if (engine.state !== 'done') engine.resume();
       else engine.notify();
@@ -871,6 +1074,7 @@
 
   function bindUIEvents() {
     $('close').addEventListener('click', closePanel);
+    $('recyclePages').addEventListener('change', () => { $('retainedPages').disabled = !$('recyclePages').checked; });
     $('rules').addEventListener('change', () => { clearHighlights(); fillRule(readRules().find((r) => r.id === $('rules').value)); message(''); });
     ui.querySelectorAll('[data-pick]').forEach((button) => button.addEventListener('click', guard(() => startPicker(button.dataset.pick))));
     $('pick-parent').addEventListener('click', chooseParent);
