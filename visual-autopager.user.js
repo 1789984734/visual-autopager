@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.5.2
+// @version      1.5.3
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -301,9 +301,64 @@
     return raw ? new URL(raw, sourceURL).href : sourceURL;
   }
 
+  function findScriptNext(doc, rule, sourceURL) {
+    // Fetched documents do not run pagination scripts. Recognize a known literal
+    // Bootstrap Paginator URL format without evaluating any page JavaScript.
+    if (doc === document) return null;
+    for (const script of doc.querySelectorAll('script:not([src])')) {
+      if (!script.textContent.includes('bootstrapPaginator')) continue;
+      const code = script.textContent.replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, (match, string) => string || ' ');
+      const initializers = code.matchAll(/(?:\$|jQuery)\(\s*(["'])(#[\w-]+)\1\s*\)\s*\.bootstrapPaginator\s*\(\s*\{([\s\S]*?)\}\s*\)/g);
+      for (const [, , selector, options] of initializers) {
+        const containers = doc.querySelectorAll(selector);
+        if (containers.length !== 1) continue;
+        const container = containers[0];
+        const probe = doc.createElement('li');
+        const link = doc.createElement('a');
+        link.setAttribute('title', 'Go to next page'); link.setAttribute('rel', 'next'); link.setAttribute('href', '#');
+        probe.append(link); container.append(probe);
+        let selected;
+        try { selected = [...doc.querySelectorAll(rule.next)].some((el) => el === link || el === probe || el === container); }
+        finally { probe.remove(); }
+        if (!selected) continue;
+        const unsupported = () => new Error('下一页由网页脚本生成，但分页参数无法可靠解析，需要适配该分页格式。');
+        const currentPage = Number(options.match(/\bcurrentPage\s*:\s*(\d+)\s*(?=,)/)?.[1]);
+        const totalPages = Number(options.match(/\btotalPages\s*:\s*(\d+)\s*(?=,)/)?.[1]);
+        if (!Number.isSafeInteger(currentPage) || !Number.isSafeInteger(totalPages) || currentPage < 1 || totalPages < currentPage) throw unsupported();
+        const source = new URL(sourceURL);
+        if (!/^\d+$/.test(source.searchParams.get('p') || '1') || Number(source.searchParams.get('p') || 1) !== currentPage) throw new Error('返回页面的页码与请求不一致，请检查分页地址或网站验证。');
+        const searchReturn = options.match(/return\s+"\/\?p="\s*\+\s*page\s*\+\s*"&search2="\s*\+\s*(\w+)\s*\+\s*"&search="\s*\+\s*encodeURIComponent\s*\(\s*(\w+)\s*\)/);
+        const typeReturn = options.match(/return\s+"\/\?type="\s*\+\s*(\w+)\s*\+\s*"&p="\s*\+\s*page\s*;/);
+        if (!/pageUrl\s*:\s*function\s*\(\s*\w+\s*,\s*page\s*,\s*\w+\s*\)/.test(options) || !/return\s+"\/\?p="\s*\+\s*page\s*;/.test(options) || !searchReturn || !typeReturn) throw unsupported();
+        const literal = (name) => {
+          const declarations = [...options.matchAll(new RegExp('\\b(?:var|let|const)\\s+' + name + '\\s*=\\s*("(?:\\\\.|[^"\\\\\\r\\n])*")\\s*;', 'g'))];
+          if (declarations.length !== 1) throw unsupported();
+          try { return JSON.parse(declarations[0][1]); } catch { throw unsupported(); }
+        };
+        const search = literal(searchReturn[2]);
+        const token = literal(searchReturn[1]);
+        const type = literal(typeReturn[1]);
+        // Follow the fresh server-provided search token and filters on every page.
+        // If the server dropped an active filter, do not silently append another list.
+        if ((source.searchParams.get('search') || '') !== search || (!search && (source.searchParams.get('type') || '') !== type)) throw new Error('返回页面的筛选条件与请求不一致，请刷新网站后重试。');
+        if (currentPage === totalPages) return null;
+        const next = new URL('/', source);
+        if (search) {
+          next.searchParams.set('p', String(currentPage + 1));
+          next.searchParams.set('search2', token); next.searchParams.set('search', search);
+        } else {
+          if (type) next.searchParams.set('type', type);
+          next.searchParams.set('p', String(currentPage + 1));
+        }
+        return next.href;
+      }
+    }
+    return null;
+  }
+
   function findNext(doc, rule, sourceURL) {
     const matches = [...doc.querySelectorAll(rule.next)].filter((el) => !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true' && !el.classList.contains('disabled'));
-    if (!matches.length) return null;
+    if (!matches.length) return findScriptNext(doc, rule, sourceURL);
     if (matches.length > 1) throw new Error(`下一页匹配了 ${matches.length} 个元素，请选择唯一的链接。`);
     const link = matches[0].matches('a[href]') ? matches[0] : matches[0].querySelector('a[href]');
     if (!link) throw new Error('下一页元素没有有效链接。按钮或接口分页需要专门适配。');
