@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.5.3
+// @version      1.5.4
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -393,7 +393,7 @@
     if (!raw?.trim()) return null;
     try {
       const url = new URL(raw.trim(), base);
-      if (/^https?:$/.test(url.protocol) || (href && /^(mailto|tel):$/.test(url.protocol))) return url.href;
+      if (/^https?:$/.test(url.protocol) || (href && /^(mailto|tel|magnet):$/.test(url.protocol))) return url.href;
       if (!href && /^data:image\/(png|jpe?g|gif|webp|avif|svg\+xml);/i.test(raw.trim())) return raw.trim();
     } catch { /* Ignore malformed resource attributes. */ }
     return null;
