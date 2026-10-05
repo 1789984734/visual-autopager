@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.5.1
+// @version      1.5.2
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -14,6 +14,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
 // ==/UserScript==
 
 (() => {
@@ -102,8 +103,8 @@
           <label class="field"><span>③ 下一页链接</span><div class="row"><input id="next" class="selector" type="text" placeholder="点选“下一页”链接"><button data-pick="next">点选下一页</button></div></label>
           <label class="check"><input id="enabled" type="checkbox" checked>启用此规则</label>
           <label class="check"><input id="auto" type="checkbox" checked>匹配页面时自动加载</label>
-          <label class="check"><input id="openInNewTab" type="checkbox">条目链接在新标签页打开</label>
-          <p class="muted">适用于当前页及追加条目的网页链接；锚点、下载和分页链接保留原行为。</p>
+          <label class="check"><input id="openInNewTab" type="checkbox">条目链接在后台新标签页打开</label>
+          <p class="muted">普通单击后停留在当前页。适用于当前及追加条目的网页链接；锚点、下载、分页和组合键点击保留原行为。</p>
           <details><summary>加载设置</summary>
             <label class="field"><span>提前加载距离（px）</span><input id="preload" type="number" value="800" min="0" max="4000" step="100"></label>
             <label class="field"><span>累计加载页数上限（含当前页）</span><input id="maxPages" type="number" value="30" min="2" max="200"></label>
@@ -455,6 +456,8 @@
       this.busy = false;
       this.disposed = false;
       this.originalLinkAttributes = new Map();
+      this.itemClickHandler = (event) => this.openItemInBackground(event);
+      this.itemClickListening = false;
       this.pages = rule.recyclePages ? [{ number: 1, nodes: [...items], keys: new Set(this.seenItems) }] : [];
       this.discardedAnchors = new Set();
       this.removedPages = 0;
@@ -672,7 +675,32 @@
     }
 
     restoreItemLinks() {
+      this.container.removeEventListener('click', this.itemClickHandler, true);
+      this.itemClickListening = false;
       for (const link of this.originalLinkAttributes.keys()) this.restoreItemLink(link);
+    }
+
+    itemLinkDestination(link, pagination, current) {
+      const raw = link.getAttribute('href')?.trim();
+      if (!raw || raw.startsWith('#') || link.hasAttribute('download')) return null;
+      if ((link.getAttribute('rel') || '').split(/\s+/).some((token) => ['next', 'prev'].includes(token.toLowerCase())) || pagination.some((el) => el === link || el.contains(link))) return null;
+      let destination;
+      try { destination = new URL(link.href); } catch { return null; }
+      if (!/^https?:$/.test(destination.protocol)) return null;
+      if (destination.hash && destination.origin === current.origin && destination.pathname === current.pathname && destination.search === current.search) return null;
+      return destination.href;
+    }
+
+    openItemInBackground(event) {
+      if (this.disposed || picker || !this.rule.enabled || !this.rule.openInNewTab || event.defaultPrevented || !event.cancelable || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      if (!wildcard(this.rule.path, location.pathname) || !samePageRoute(this.route, location.href)) return;
+      const link = event.composedPath().find((node) => node instanceof Element && node.matches('a[href]'));
+      if (!link || !this.originalLinkAttributes.has(link)) return;
+      const destination = this.itemLinkDestination(link, [...document.querySelectorAll(this.rule.next)], new URL(location.href));
+      if (!destination) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      GM_openInTab(destination, { active: false });
     }
 
     syncItemLinks(items = null) {
@@ -688,13 +716,7 @@
       const eligible = fullSync ? new Set() : null;
       const current = new URL(location.href);
       for (const link of links) {
-        const raw = link.getAttribute('href')?.trim();
-        if (!raw || raw.startsWith('#') || link.hasAttribute('download')) continue;
-        if ((link.getAttribute('rel') || '').split(/\s+/).some((token) => ['next', 'prev'].includes(token.toLowerCase())) || pagination.some((el) => el === link || el.contains(link))) continue;
-        let destination;
-        try { destination = new URL(link.href); } catch { continue; }
-        if (!/^https?:$/.test(destination.protocol)) continue;
-        if (destination.hash && destination.origin === current.origin && destination.pathname === current.pathname && destination.search === current.search) continue;
+        if (!this.itemLinkDestination(link, pagination, current)) continue;
         eligible?.add(link);
         if (!this.originalLinkAttributes.has(link)) this.originalLinkAttributes.set(link, { target: link.getAttribute('target'), rel: link.getAttribute('rel') });
         if (link.getAttribute('target') !== '_blank') link.setAttribute('target', '_blank');
@@ -703,6 +725,10 @@
       }
       // Restore links that are no longer part of the current rule's content scope.
       if (fullSync) for (const link of this.originalLinkAttributes.keys()) if (!eligible.has(link)) this.restoreItemLink(link);
+      if (!this.itemClickListening) {
+        this.container.addEventListener('click', this.itemClickHandler, true);
+        this.itemClickListening = true;
+      }
     }
 
     arm() {
