@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.5.4
+// @version      1.6.0
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -105,7 +105,10 @@
           <label class="check"><input id="auto" type="checkbox" checked>匹配页面时自动加载</label>
           <label class="check"><input id="openInNewTab" type="checkbox">条目链接在后台新标签页打开</label>
           <p class="muted">普通单击后停留在当前页。适用于当前及追加条目的网页链接；锚点、下载、分页和组合键点击保留原行为。</p>
+          <label class="check"><input id="alignPageDown" type="checkbox">Page Down 按整排卡片滚动</label>
+          <p class="muted">从底部尚未完整显示的一排开始；适用于等高卡片网格。超高条目分段阅读。</p>
           <details><summary>加载设置</summary>
+            <label class="field"><span>Page Down 顶部预留高度（px）</span><input id="pageDownOffset" type="number" value="0" min="0" max="400"><small class="muted">有固定顶部导航时填写其遮挡高度，默认 0。</small></label>
             <label class="field"><span>提前加载距离（px）</span><input id="preload" type="number" value="800" min="0" max="4000" step="100"></label>
             <label class="field"><span>累计加载页数上限（含当前页）</span><input id="maxPages" type="number" value="30" min="2" max="200"></label>
             <label class="check"><input id="dedupe" type="checkbox" checked>跳过重复条目</label>
@@ -168,6 +171,8 @@
       container: string('container'), items: string('items'), next: string('next'),
       enabled: raw.enabled !== false, auto: raw.auto !== false, dedupe: raw.dedupe !== false,
       openInNewTab: raw.openInNewTab === true,
+      alignPageDown: raw.alignPageDown === true,
+      pageDownOffset: raw.pageDownOffset === undefined ? 0 : number('pageDownOffset', 0, 400),
       recyclePages: raw.recyclePages === true,
       retainedPages: raw.retainedPages === undefined ? 10 : number('retainedPages', 1, 50),
       preload: number('preload', 0, 4000), maxPages: number('maxPages', 2, 200),
@@ -262,6 +267,8 @@
     for (const key of ['container', 'items', 'next']) $(key).value = rule?.[key] || '';
     for (const key of ['enabled', 'auto', 'dedupe']) $(key).checked = rule?.[key] !== false;
     $('openInNewTab').checked = rule?.openInNewTab === true;
+    $('alignPageDown').checked = rule?.alignPageDown === true;
+    $('pageDownOffset').value = rule?.pageDownOffset ?? 0;
     $('recyclePages').checked = rule?.recyclePages === true;
     $('retainedPages').value = rule?.retainedPages ?? 10;
     $('retainedPages').disabled = !$('recyclePages').checked;
@@ -276,6 +283,7 @@
       container: $('container').value, items: $('items').value, next: $('next').value,
       enabled: $('enabled').checked, auto: $('auto').checked, dedupe: $('dedupe').checked,
       openInNewTab: $('openInNewTab').checked,
+      alignPageDown: $('alignPageDown').checked, pageDownOffset: Number($('pageDownOffset').value),
       recyclePages: $('recyclePages').checked, retainedPages: Number($('retainedPages').value),
       preload: Number($('preload').value), maxPages: Number($('maxPages').value), updatedAt: Date.now(),
     });
@@ -513,6 +521,7 @@
       this.originalLinkAttributes = new Map();
       this.itemClickHandler = (event) => this.openItemInBackground(event);
       this.itemClickListening = false;
+      this.pageDownHandler = (event) => this.alignPageDown(event);
       this.pages = rule.recyclePages ? [{ number: 1, nodes: [...items], keys: new Set(this.seenItems) }] : [];
       this.discardedAnchors = new Set();
       this.removedPages = 0;
@@ -529,11 +538,55 @@
       this.recycleHandler = () => this.scheduleRecycle();
       this.syncItemLinks(items);
       this.configureRecycling();
+      this.configurePageDown();
       this.notify();
       if (rule.auto && this.next) this.resume();
     }
 
     notify() { if (!this.disposed) renderStatus(this); }
+
+    configurePageDown() {
+      document.removeEventListener('keydown', this.pageDownHandler);
+      if (!this.disposed && this.rule.enabled && this.rule.alignPageDown) document.addEventListener('keydown', this.pageDownHandler);
+    }
+
+    alignPageDown(event) {
+      if (event.key !== 'PageDown' || event.defaultPrevented || !event.cancelable || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.isComposing) return;
+      if (this.disposed || needsRefresh || picker || !this.rule.enabled || !this.rule.alignPageDown || !this.container.isConnected || !samePageRoute(this.route, location.href) || !wildcard(this.rule.path, location.pathname)) return;
+      const path = event.composedPath();
+      if (path.some((el) => el === host || (el instanceof Element && (el.isContentEditable || el.matches('input,textarea,select,[role="textbox"],[role="combobox"],[role="slider"],[role="spinbutton"]'))))) return;
+      const root = scrollRoot(this.container);
+      // Let an unrelated focused scroll area keep its own keyboard navigation.
+      for (let el = event.target instanceof Element ? event.target : null; el && el !== root && el !== document.body; el = el.parentElement) {
+        if (el !== this.container && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight) return;
+      }
+      if (root && event.target !== document.body && event.target !== document.documentElement && !root.contains(event.target)) return;
+      const rootRect = root?.getBoundingClientRect();
+      const top = (root ? Math.max(0, rootRect.top + root.clientTop) : 0) + this.rule.pageDownOffset;
+      const bottom = root ? Math.min(innerHeight, rootRect.top + root.clientTop + root.clientHeight) : innerHeight;
+      if (bottom - top <= 1) return;
+      const rects = [...this.container.querySelectorAll(this.rule.items)]
+        .filter((el) => !el.hasAttribute('data-vap-spacer'))
+        .map((el) => el.getBoundingClientRect())
+        .filter((rect) => rect.width > 0 && rect.height > 0 && rect.bottom > top)
+        .sort((a, b) => a.top - b.top || a.left - b.left);
+      if (!rects.some((rect) => rect.top < bottom)) return;
+      const rows = [];
+      for (const rect of rects) {
+        const row = rows.at(-1);
+        if (row && Math.abs(row.top - rect.top) <= 2) row.bottom = Math.max(row.bottom, rect.bottom);
+        else rows.push({ top: rect.top, bottom: rect.bottom });
+      }
+      const next = rows.find((row) => row.bottom > bottom + 1);
+      if (!next) return;
+      // A row taller than the readable viewport must make forward progress.
+      const distance = next.top > top + 1 ? next.top - top : (bottom - top) * 0.9;
+      const scrollNode = root || document.scrollingElement;
+      if (!scrollNode || scrollNode.scrollHeight - scrollNode.clientHeight - scrollNode.scrollTop <= 1) return;
+      event.preventDefault();
+      const scale = root?.offsetHeight ? rootRect.height / root.offsetHeight : 1;
+      (root || window).scrollBy({ top: distance / (scale || 1), behavior: 'instant' });
+    }
 
     configureRecycling() {
       this.stopRecycling();
@@ -817,6 +870,7 @@
 
     destroy() {
       this.disposed = true; this.observer?.disconnect(); this.controller?.abort();
+      document.removeEventListener('keydown', this.pageDownHandler);
       this.stopRecycling(); this.restoreItemLinks();
       this.pages.forEach((page) => { page.nodes.length = 0; page.keys.clear(); });
       this.pages.length = 0; this.seenItems.clear(); this.seenPages.clear(); this.discardedAnchors.clear();
@@ -1167,6 +1221,7 @@
       engine.rule = rule;
       engine.syncItemLinks();
       engine.configureRecycling();
+      engine.configurePageDown();
       if (!rule.enabled || !rule.auto || !wildcard(rule.path, location.pathname)) engine.pause('规则已保存，自动加载已暂停。');
       else if (engine.state !== 'done') engine.resume();
       else engine.notify();
