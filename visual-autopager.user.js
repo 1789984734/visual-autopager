@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.6.0
+// @version      1.7.0
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -108,7 +108,8 @@
           <label class="check"><input id="alignPageDown" type="checkbox">Page Down 按整排卡片滚动</label>
           <p class="muted">从底部尚未完整显示的一排开始；适用于等高卡片网格。超高条目分段阅读。</p>
           <details><summary>加载设置</summary>
-            <label class="field"><span>Page Down 顶部预留高度（px）</span><input id="pageDownOffset" type="number" value="0" min="0" max="400"><small class="muted">有固定顶部导航时填写其遮挡高度，默认 0。</small></label>
+            <label class="field"><span>Page Down 顶部避让</span><select id="pageDownOffsetMode"><option value="auto">自动识别顶部遮挡</option><option value="manual">手动指定高度</option></select></label>
+            <label class="field"><span>Page Down 顶部预留高度（px）</span><input id="pageDownOffset" type="number" value="0" min="0" max="400" disabled><small class="muted">手动模式覆盖自动识别；填写 0 表示不预留。</small></label>
             <label class="field"><span>提前加载距离（px）</span><input id="preload" type="number" value="800" min="0" max="4000" step="100"></label>
             <label class="field"><span>累计加载页数上限（含当前页）</span><input id="maxPages" type="number" value="30" min="2" max="200"></label>
             <label class="check"><input id="dedupe" type="checkbox" checked>跳过重复条目</label>
@@ -173,6 +174,7 @@
       openInNewTab: raw.openInNewTab === true,
       alignPageDown: raw.alignPageDown === true,
       pageDownOffset: raw.pageDownOffset === undefined ? 0 : number('pageDownOffset', 0, 400),
+      pageDownOffsetMode: raw.pageDownOffsetMode === 'manual' || (raw.pageDownOffsetMode !== 'auto' && Number(raw.pageDownOffset) > 0) ? 'manual' : 'auto',
       recyclePages: raw.recyclePages === true,
       retainedPages: raw.retainedPages === undefined ? 10 : number('retainedPages', 1, 50),
       preload: number('preload', 0, 4000), maxPages: number('maxPages', 2, 200),
@@ -269,6 +271,8 @@
     $('openInNewTab').checked = rule?.openInNewTab === true;
     $('alignPageDown').checked = rule?.alignPageDown === true;
     $('pageDownOffset').value = rule?.pageDownOffset ?? 0;
+    $('pageDownOffsetMode').value = rule?.pageDownOffsetMode ?? 'auto';
+    $('pageDownOffset').disabled = $('pageDownOffsetMode').value !== 'manual';
     $('recyclePages').checked = rule?.recyclePages === true;
     $('retainedPages').value = rule?.retainedPages ?? 10;
     $('retainedPages').disabled = !$('recyclePages').checked;
@@ -284,6 +288,7 @@
       enabled: $('enabled').checked, auto: $('auto').checked, dedupe: $('dedupe').checked,
       openInNewTab: $('openInNewTab').checked,
       alignPageDown: $('alignPageDown').checked, pageDownOffset: Number($('pageDownOffset').value),
+      pageDownOffsetMode: $('pageDownOffsetMode').value,
       recyclePages: $('recyclePages').checked, retainedPages: Number($('retainedPages').value),
       preload: Number($('preload').value), maxPages: Number($('maxPages').value), updatedAt: Date.now(),
     });
@@ -550,6 +555,44 @@
       if (!this.disposed && this.rule.enabled && this.rule.alignPageDown) document.addEventListener('keydown', this.pageDownHandler);
     }
 
+    readableTop(root, baseTop, bottom) {
+      if (this.rule.pageDownOffsetMode === 'manual') return baseTop + this.rule.pageDownOffset;
+      const bounds = this.container.getBoundingClientRect();
+      const left = Math.max(0, bounds.left), right = Math.min(innerWidth, bounds.right);
+      if (right <= left) return baseTop;
+      const positions = [0.1, 0.5, 0.9].map((part) => left + (right - left) * part);
+      let edge = baseTop;
+      // Sample the visible stack at the reading area's top, not the entire DOM.
+      // Advance over stacked bars using their union rather than adding heights.
+      for (let layer = 0; layer < 8; layer++) {
+        const seen = new Set();
+        let next = edge;
+        for (const x of positions) for (const hit of document.elementsFromPoint(x, edge + 1).filter((el) => el !== host && !host?.contains(el)).slice(0, 1)) {
+          if (hit === host || host?.contains(hit)) continue;
+          for (let el = hit; el && el !== document.body; el = el.parentElement) {
+            if (seen.has(el)) break;
+            seen.add(el);
+            if (el === root || el === this.container || el.contains(this.container)) continue;
+            const style = getComputedStyle(el);
+            if (!['fixed', 'sticky'].includes(style.position) || style.visibility !== 'visible' || Number(style.opacity) === 0) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.height <= 0 || rect.height > (bottom - baseTop) * 0.5 || rect.top > edge + 1 || rect.bottom <= edge + 1) continue;
+            if (Math.min(right, rect.right) - Math.max(left, rect.left) < (right - left) * 0.5) continue;
+            // A sticky descendant of another scroll area must not affect this list.
+            if (style.position === 'sticky' && scrollRoot(el.parentElement) !== root) continue;
+            let visible = true;
+            for (let parent = el.parentElement; parent && parent !== document.body; parent = parent.parentElement) {
+              if (Number(getComputedStyle(parent).opacity) === 0) { visible = false; break; }
+            }
+            if (visible) next = Math.max(next, Math.min(bottom, rect.bottom));
+          }
+        }
+        if (next <= edge || next >= bottom) break;
+        edge = next;
+      }
+      return edge;
+    }
+
     alignPageDown(event) {
       if (event.key !== 'PageDown' || event.defaultPrevented || !event.cancelable || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.isComposing) return;
       if (this.disposed || needsRefresh || picker || !this.rule.enabled || !this.rule.alignPageDown || !this.container.isConnected || !samePageRoute(this.route, location.href) || !wildcard(this.rule.path, location.pathname)) return;
@@ -562,12 +605,13 @@
       }
       if (root && event.target !== document.body && event.target !== document.documentElement && !root.contains(event.target)) return;
       const rootRect = root?.getBoundingClientRect();
-      const top = (root ? Math.max(0, rootRect.top + root.clientTop) : 0) + this.rule.pageDownOffset;
+      const baseTop = root ? Math.max(0, rootRect.top + root.clientTop) : 0;
       const bottom = root ? Math.min(innerHeight, rootRect.top + root.clientTop + root.clientHeight) : innerHeight;
+      const top = this.readableTop(root, baseTop, bottom);
       if (bottom - top <= 1) return;
       const rects = [...this.container.querySelectorAll(this.rule.items)]
         .filter((el) => !el.hasAttribute('data-vap-spacer'))
-        .map((el) => el.getBoundingClientRect())
+        .map((el) => { const rect = el.getBoundingClientRect(); return { el, top: rect.top, bottom: rect.bottom, left: rect.left, width: rect.width, height: rect.height }; })
         .filter((rect) => rect.width > 0 && rect.height > 0 && rect.bottom > top)
         .sort((a, b) => a.top - b.top || a.left - b.left);
       if (!rects.some((rect) => rect.top < bottom)) return;
@@ -575,7 +619,7 @@
       for (const rect of rects) {
         const row = rows.at(-1);
         if (row && Math.abs(row.top - rect.top) <= 2) row.bottom = Math.max(row.bottom, rect.bottom);
-        else rows.push({ top: rect.top, bottom: rect.bottom });
+        else rows.push({ el: rect.el, top: rect.top, bottom: rect.bottom });
       }
       const next = rows.find((row) => row.bottom > bottom + 1);
       if (!next) return;
@@ -586,6 +630,18 @@
       event.preventDefault();
       const scale = root?.offsetHeight ? rootRect.height / root.offsetHeight : 1;
       (root || window).scrollBy({ top: distance / (scale || 1), behavior: 'instant' });
+      // Recheck CSS sticky headers activated by this jump. Keep correction bounded
+      // and synchronous; there are no scroll listeners or background timers.
+      if (this.rule.pageDownOffsetMode === 'auto' && next.top > top + 1) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const newRect = root?.getBoundingClientRect();
+          const newBase = root ? Math.max(0, newRect.top + root.clientTop) : 0;
+          const newBottom = root ? Math.min(innerHeight, newRect.top + root.clientTop + root.clientHeight) : innerHeight;
+          const correction = next.el.getBoundingClientRect().top - this.readableTop(root, newBase, newBottom);
+          if (Math.abs(correction) <= 1) break;
+          (root || window).scrollBy({ top: correction / (scale || 1), behavior: 'instant' });
+        }
+      }
     }
 
     configureRecycling() {
@@ -1233,6 +1289,7 @@
   }
 
   function bindUIEvents() {
+    $('pageDownOffsetMode').addEventListener('change', () => { $('pageDownOffset').disabled = $('pageDownOffsetMode').value !== 'manual'; });
     $('close').addEventListener('click', closePanel);
     $('recyclePages').addEventListener('change', () => { $('retainedPages').disabled = !$('recyclePages').checked; });
     $('rules').addEventListener('change', () => { clearHighlights(); fillRule(readRules().find((r) => r.id === $('rules').value)); message(''); });
