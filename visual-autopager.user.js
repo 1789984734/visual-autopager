@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.7.0
+// @version      1.8.0
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -15,6 +15,8 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // ==/UserScript==
 
 (() => {
@@ -23,6 +25,7 @@
   if (window.top !== window.self || document.getElementById('vap-ui-host')) return;
 
   const STORE = 'visual-autopager.rules.v1';
+  const OPENED_TTL = 3 * 24 * 60 * 60 * 1000;
   const RECYCLE_INTERVAL = 200;
   const LABELS = { idle: '自动加载中', loading: '正在加载', paused: '已暂停', error: '加载失败', done: '已结束' };
   let engine = null;
@@ -105,6 +108,8 @@
           <label class="check"><input id="auto" type="checkbox" checked>匹配页面时自动加载</label>
           <label class="check"><input id="openInNewTab" type="checkbox">条目链接在后台新标签页打开</label>
           <p class="muted">普通单击后停留在当前页。适用于当前及追加条目的网页链接；锚点、下载、分页和组合键点击保留原行为。</p>
+          <label class="check"><input id="markOpenedLinks" type="checkbox">标记最近三天打开过的链接</label>
+          <p class="muted">已打开的条目链接文字变灰，本机保存 72 小时；再次打开重新计时。</p>
           <label class="check"><input id="alignPageDown" type="checkbox">Page Down 按整排卡片滚动</label>
           <p class="muted">从底部尚未完整显示的一排开始；适用于等高卡片网格。超高条目分段阅读。</p>
           <details><summary>加载设置</summary>
@@ -172,6 +177,7 @@
       container: string('container'), items: string('items'), next: string('next'),
       enabled: raw.enabled !== false, auto: raw.auto !== false, dedupe: raw.dedupe !== false,
       openInNewTab: raw.openInNewTab === true,
+      markOpenedLinks: raw.markOpenedLinks === true,
       alignPageDown: raw.alignPageDown === true,
       pageDownOffset: raw.pageDownOffset === undefined ? 0 : number('pageDownOffset', 0, 400),
       pageDownOffsetMode: raw.pageDownOffsetMode === 'manual' || (raw.pageDownOffsetMode !== 'auto' && Number(raw.pageDownOffset) > 0) ? 'manual' : 'auto',
@@ -269,6 +275,7 @@
     for (const key of ['container', 'items', 'next']) $(key).value = rule?.[key] || '';
     for (const key of ['enabled', 'auto', 'dedupe']) $(key).checked = rule?.[key] !== false;
     $('openInNewTab').checked = rule?.openInNewTab === true;
+    $('markOpenedLinks').checked = rule?.markOpenedLinks === true;
     $('alignPageDown').checked = rule?.alignPageDown === true;
     $('pageDownOffset').value = rule?.pageDownOffset ?? 0;
     $('pageDownOffsetMode').value = rule?.pageDownOffsetMode ?? 'auto';
@@ -287,6 +294,7 @@
       container: $('container').value, items: $('items').value, next: $('next').value,
       enabled: $('enabled').checked, auto: $('auto').checked, dedupe: $('dedupe').checked,
       openInNewTab: $('openInNewTab').checked,
+      markOpenedLinks: $('markOpenedLinks').checked,
       alignPageDown: $('alignPageDown').checked, pageDownOffset: Number($('pageDownOffset').value),
       pageDownOffsetMode: $('pageDownOffsetMode').value,
       recyclePages: $('recyclePages').checked, retainedPages: Number($('retainedPages').value),
@@ -506,6 +514,158 @@
     return null;
   }
 
+  class OpenedLinkMarks {
+    constructor(pager) {
+      this.pager = pager;
+      this.key = `${STORE}.opened.v1.${encodeURIComponent(pager.rule.origin)}`;
+      this.links = new Map();
+      this.urlLinks = new Map();
+      this.records = new Map();
+      this.timer = null;
+      this.disposed = false;
+      this.style = document.createElement('style');
+      this.style.setAttribute('data-vap-opened-style', '');
+      this.style.textContent = 'a[data-vap-opened="true"],a[data-vap-opened="true"] :is(span,strong,b,em,i,font){color:#888!important;}';
+      (document.head || document.documentElement).append(this.style);
+      this.clickHandler = (event) => this.onClick(event);
+      this.visibilityHandler = () => { if (!document.hidden) this.refresh(); };
+      this.pageShowHandler = () => this.refresh();
+      pager.container.addEventListener('click', this.clickHandler, true);
+      pager.container.addEventListener('auxclick', this.clickHandler, true);
+      document.addEventListener('visibilitychange', this.visibilityHandler);
+      window.addEventListener('pageshow', this.pageShowHandler);
+      this.listener = GM_addValueChangeListener(this.key, (key, before, value, remote) => {
+        if (remote && !this.disposed) this.refresh(value);
+      });
+      this.refresh();
+    }
+
+    linkKey(url) { return canonical(url); }
+
+    parse(raw) {
+      const now = Date.now();
+      const records = new Map();
+      if (!Array.isArray(raw)) return records;
+      for (const entry of raw) {
+        if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' || !/^https?:\/\//i.test(entry[0]) || !Number.isFinite(entry[1]) || entry[1] <= now - OPENED_TTL || entry[1] > now) continue;
+        let url;
+        try { url = this.linkKey(entry[0]); } catch { continue; }
+        records.set(url, Math.max(records.get(url) || 0, entry[1]));
+      }
+      return records;
+    }
+
+    refresh(raw = GM_getValue(this.key, [])) {
+      if (this.disposed) return;
+      const next = this.parse(raw);
+      // Merge timestamps so delayed updates from another tab do not erase an
+      // opening that this tab has already recorded. Expired records stay expired.
+      let merged = false;
+      for (const [url, time] of this.parse([...this.records])) if ((next.get(url) || 0) < time) { next.set(url, time); merged = true; }
+      const changed = new Set();
+      for (const [url, time] of this.records) if (next.get(url) !== time) changed.add(url);
+      for (const [url, time] of next) if (this.records.get(url) !== time) changed.add(url);
+      this.records = next;
+      if (merged || (Array.isArray(raw) && raw.length !== next.size)) this.persist();
+      this.paint(changed); this.scheduleExpiry();
+    }
+
+    persist() { GM_setValue(this.key, [...this.records]); }
+
+    scheduleExpiry() {
+      if (this.timer !== null) clearTimeout(this.timer);
+      this.timer = null;
+      if (!this.records.size || this.disposed) return;
+      let earliest = Infinity;
+      for (const time of this.records.values()) earliest = Math.min(earliest, time + OPENED_TTL);
+      this.timer = setTimeout(() => { this.timer = null; this.refresh(); }, Math.max(1, earliest - Date.now()));
+    }
+
+    paintLink(link, entry) {
+      let opened = false;
+      try { const time = this.records.get(this.linkKey(link.href)); opened = Boolean(time && time > Date.now() - OPENED_TTL); } catch { /* A website may have changed the link. */ }
+      if (opened) { if (link.getAttribute('data-vap-opened') !== 'true') link.setAttribute('data-vap-opened', 'true'); }
+      else if (entry.original === null) { if (link.hasAttribute('data-vap-opened')) link.removeAttribute('data-vap-opened'); }
+      else if (link.getAttribute('data-vap-opened') !== entry.original) link.setAttribute('data-vap-opened', entry.original);
+    }
+
+    paint(urls) {
+      for (const url of urls) for (const link of this.urlLinks.get(url) || []) this.paintLink(link, this.links.get(link));
+    }
+
+    indexLink(link, url) {
+      const entry = this.links.get(link);
+      if (entry.url) {
+        const old = this.urlLinks.get(entry.url);
+        old?.delete(link); if (old?.size === 0) this.urlLinks.delete(entry.url);
+      }
+      entry.url = url;
+      if (!this.urlLinks.has(url)) this.urlLinks.set(url, new Set());
+      this.urlLinks.get(url).add(link);
+    }
+
+    addItems(items) {
+      const pagination = [...document.querySelectorAll(this.pager.rule.next)];
+      const current = new URL(location.href);
+      for (const item of items) {
+        if (item.hasAttribute('data-vap-spacer')) continue;
+        const links = [...item.querySelectorAll('a[href]')];
+        if (item.matches('a[href]')) links.unshift(item);
+        for (const link of links) {
+          const destination = this.pager.itemLinkDestination(link, pagination, current);
+          if (!destination) continue;
+          if (!this.links.has(link)) this.links.set(link, { original: link.getAttribute('data-vap-opened') });
+          this.indexLink(link, this.linkKey(destination));
+          this.paintLink(link, this.links.get(link));
+        }
+      }
+    }
+
+    record(link, destination) {
+      if (this.disposed) return;
+      const key = this.linkKey(destination);
+      if (this.links.has(link)) this.indexLink(link, key);
+      this.refresh();
+      this.records.set(key, Date.now());
+      this.persist(); this.paint(new Set([key])); this.scheduleExpiry();
+    }
+
+    onClick(event) {
+      const pager = this.pager;
+      if (this.disposed || pager.disposed || picker || needsRefresh || !pager.rule.enabled || !pager.rule.markOpenedLinks || event.defaultPrevented || event.altKey) return;
+      if (!((event.type === 'click' && event.button === 0) || (event.type === 'auxclick' && event.button === 1))) return;
+      if (!samePageRoute(pager.route, location.href) || !wildcard(pager.rule.path, location.pathname)) return;
+      const link = event.composedPath().find((node) => node instanceof Element && node.matches('a[href]'));
+      if (!link || !this.links.has(link)) return;
+      const destination = pager.itemLinkDestination(link, [...document.querySelectorAll(pager.rule.next)], new URL(location.href));
+      if (!destination) return;
+      // Native navigation is recorded only after the page has had a chance to
+      // cancel it. Background opening is recorded explicitly by the pager.
+      queueMicrotask(() => { if (!event.defaultPrevented) this.record(link, destination); });
+    }
+
+    forgetLink(link) {
+      const entry = this.links.get(link);
+      if (!entry) return;
+      if (entry.original === null) link.removeAttribute('data-vap-opened'); else link.setAttribute('data-vap-opened', entry.original);
+      const indexed = this.urlLinks.get(entry.url);
+      indexed?.delete(link); if (indexed?.size === 0) this.urlLinks.delete(entry.url);
+      this.links.delete(link);
+    }
+
+    destroy() {
+      this.disposed = true;
+      if (this.timer !== null) clearTimeout(this.timer);
+      GM_removeValueChangeListener(this.listener);
+      this.pager.container.removeEventListener('click', this.clickHandler, true);
+      this.pager.container.removeEventListener('auxclick', this.clickHandler, true);
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      window.removeEventListener('pageshow', this.pageShowHandler);
+      for (const link of this.links.keys()) this.forgetLink(link);
+      this.style.remove(); this.records.clear(); this.timer = null;
+    }
+  }
+
   class Pager {
     constructor(rule) {
       this.rule = rule;
@@ -524,6 +684,7 @@
       this.busy = false;
       this.disposed = false;
       this.originalLinkAttributes = new Map();
+      this.openedMarks = null;
       this.itemClickHandler = (event) => this.openItemInBackground(event);
       this.itemClickListening = false;
       this.pageDownHandler = (event) => this.alignPageDown(event);
@@ -811,8 +972,8 @@
             if (el.id) this.discardedAnchors.add(el.id);
             if (el.localName === 'a' && el.getAttribute('name')) this.discardedAnchors.add(el.getAttribute('name'));
           }
-          if (node.localName === 'a') this.originalLinkAttributes.delete(node);
-          node.querySelectorAll('a').forEach((link) => this.originalLinkAttributes.delete(link));
+          if (node.localName === 'a') { this.originalLinkAttributes.delete(node); this.openedMarks?.forgetLink(node); }
+          node.querySelectorAll('a').forEach((link) => { this.originalLinkAttributes.delete(link); this.openedMarks?.forgetLink(link); });
         }
         page.keys.forEach((key) => this.seenItems.delete(key));
         page.nodes.length = 0;
@@ -865,9 +1026,18 @@
       event.preventDefault();
       event.stopImmediatePropagation();
       GM_openInTab(destination, { active: false });
+      this.openedMarks?.record(link, destination);
     }
 
     syncItemLinks(items = null) {
+      if (this.rule.markOpenedLinks && this.rule.enabled && wildcard(this.rule.path, location.pathname)) {
+        this.openedMarks ||= new OpenedLinkMarks(this);
+        if (items === null) {
+          for (const link of [...this.openedMarks.links.keys()]) this.openedMarks.forgetLink(link);
+          this.openedMarks.refresh();
+        }
+        this.openedMarks.addItems(items || this.container.querySelectorAll(this.rule.items));
+      } else { this.openedMarks?.destroy(); this.openedMarks = null; }
       if (!this.rule.openInNewTab || !this.rule.enabled || !wildcard(this.rule.path, location.pathname)) return this.restoreItemLinks();
       const fullSync = items === null;
       const pagination = [...document.querySelectorAll(this.rule.next)];
@@ -926,6 +1096,7 @@
 
     destroy() {
       this.disposed = true; this.observer?.disconnect(); this.controller?.abort();
+      this.openedMarks?.destroy(); this.openedMarks = null;
       document.removeEventListener('keydown', this.pageDownHandler);
       this.stopRecycling(); this.restoreItemLinks();
       this.pages.forEach((page) => { page.nodes.length = 0; page.keys.clear(); });
