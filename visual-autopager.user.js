@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.8.0
+// @version      1.8.1
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -113,6 +113,8 @@
           <label class="check"><input id="alignPageDown" type="checkbox">Page Down 按整排卡片滚动</label>
           <p class="muted">从底部尚未完整显示的一排开始；适用于等高卡片网格。超高条目分段阅读。</p>
           <details><summary>加载设置</summary>
+            <label class="check"><input id="protectRepaint" type="checkbox">兼容网站重绘（保护追加内容）</label>
+            <p class="muted">仅为出现内容闪现后消失的网站开启。列表被清空后尝试恢复追加条目；频繁重绘或内容变化时停止，并提示刷新。</p>
             <label class="field"><span>Page Down 顶部避让</span><select id="pageDownOffsetMode"><option value="auto">自动识别顶部遮挡</option><option value="manual">手动指定高度</option></select></label>
             <label class="field"><span>Page Down 顶部预留高度（px）</span><input id="pageDownOffset" type="number" value="0" min="0" max="400" disabled><small class="muted">手动模式覆盖自动识别；填写 0 表示不预留。</small></label>
             <label class="field"><span>提前加载距离（px）</span><input id="preload" type="number" value="800" min="0" max="4000" step="100"></label>
@@ -178,6 +180,7 @@
       enabled: raw.enabled !== false, auto: raw.auto !== false, dedupe: raw.dedupe !== false,
       openInNewTab: raw.openInNewTab === true,
       markOpenedLinks: raw.markOpenedLinks === true,
+      protectRepaint: raw.protectRepaint === true,
       alignPageDown: raw.alignPageDown === true,
       pageDownOffset: raw.pageDownOffset === undefined ? 0 : number('pageDownOffset', 0, 400),
       pageDownOffsetMode: raw.pageDownOffsetMode === 'manual' || (raw.pageDownOffsetMode !== 'auto' && Number(raw.pageDownOffset) > 0) ? 'manual' : 'auto',
@@ -227,11 +230,16 @@
   }
 
   function checkRoute() {
-    if (location.href === route) return;
-    const preserve = samePageRoute(route, location.href) && (!engine || engine.container.isConnected);
+    if (location.href === route) {
+      // Reuse the existing route check; no extra polling or document-wide observer.
+      if (engine?.recovery && !engine.container.isConnected) engine.recovery.schedule();
+      return;
+    }
+    const preserve = samePageRoute(route, location.href) && (!engine || engine.container.isConnected || engine.recovery?.valid());
     route = location.href;
     if (preserve) {
       if (engine) engine.route = route;
+      if (engine?.recovery && !engine.container.isConnected) engine.recovery.schedule();
       return;
     }
     closePanel();
@@ -276,6 +284,7 @@
     for (const key of ['enabled', 'auto', 'dedupe']) $(key).checked = rule?.[key] !== false;
     $('openInNewTab').checked = rule?.openInNewTab === true;
     $('markOpenedLinks').checked = rule?.markOpenedLinks === true;
+    $('protectRepaint').checked = rule?.protectRepaint === true;
     $('alignPageDown').checked = rule?.alignPageDown === true;
     $('pageDownOffset').value = rule?.pageDownOffset ?? 0;
     $('pageDownOffsetMode').value = rule?.pageDownOffsetMode ?? 'auto';
@@ -295,6 +304,7 @@
       enabled: $('enabled').checked, auto: $('auto').checked, dedupe: $('dedupe').checked,
       openInNewTab: $('openInNewTab').checked,
       markOpenedLinks: $('markOpenedLinks').checked,
+      protectRepaint: $('protectRepaint').checked,
       alignPageDown: $('alignPageDown').checked, pageDownOffset: Number($('pageDownOffset').value),
       pageDownOffsetMode: $('pageDownOffsetMode').value,
       recyclePages: $('recyclePages').checked, retainedPages: Number($('retainedPages').value),
@@ -666,6 +676,152 @@
     }
   }
 
+  class ContentRecovery {
+    constructor(pager, items) {
+      this.pager = pager;
+      this.nodes = new Set();
+      this.base = documentBase(document, pager.source);
+      this.firstKeys = items.map((item) => itemKey(item, this.base));
+      this.timer = null;
+      this.attempts = 0;
+      this.restoredAt = [];
+      this.blocked = false;
+      this.disposed = false;
+      this.observer = new MutationObserver((records) => {
+        if (records.some((record) => [...record.removedNodes].some((node) => this.nodes.has(node) || node === pager.last || node === pager.spacer))) this.schedule();
+      });
+      if (items.some((item) => item.parentElement !== pager.container) || this.firstKeys.some((key) => !key)) {
+        this.block('重绘兼容需要有内容签名的直接子条目，请调整容器与条目选择器。');
+      } else this.observe();
+    }
+
+    get pending() { return this.timer !== null; }
+
+    valid() {
+      const pager = this.pager;
+      return !this.disposed && !this.blocked && !pager.disposed && pager.rule.enabled && pager.rule.protectRepaint && !needsRefresh && samePageRoute(pager.route, location.href);
+    }
+
+    observe() {
+      this.observer.disconnect();
+      if (this.valid()) this.observer.observe(this.pager.container, { childList: true });
+    }
+
+    schedule() {
+      if (!this.valid() || this.pending) return;
+      this.pager.observer?.disconnect();
+      this.recycleWasListening = this.pager.recycleListening;
+      this.pager.stopRecycling();
+      this.attempts = 0;
+      this.queue();
+    }
+
+    queue() {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        if (this.valid()) {
+          try { this.recover(); } catch { this.block('网站重绘后的结构无法安全恢复，已停止，请刷新页面。'); }
+        } else this.stop();
+      }, 150);
+    }
+
+    retry() {
+      if (++this.attempts < 10) this.queue();
+      else this.block('网站重绘后未恢复可识别的列表，已停止，请刷新页面。');
+    }
+
+    block(reason) {
+      this.blocked = true;
+      this.stop();
+      this.pager.stopRecycling();
+      this.pager.controller?.abort();
+      // Failed recovery must not keep detached pages or link caches alive.
+      if (!this.pager.container.isConnected) {
+        this.pager.restoreItemLinks();
+        this.pager.openedMarks?.destroy(); this.pager.openedMarks = null;
+        document.removeEventListener('keydown', this.pager.pageDownHandler);
+        this.pager.container = document.createElement('div');
+      }
+      if (!this.pager.last.isConnected) this.pager.last = this.pager.container;
+      for (const page of this.pager.pages) page.nodes = page.nodes.filter((node) => node.isConnected);
+      for (const link of this.pager.originalLinkAttributes.keys()) if (!link.isConnected) this.pager.restoreItemLink(link);
+      if (this.pager.openedMarks) for (const link of this.pager.openedMarks.links.keys()) if (!link.isConnected) this.pager.openedMarks.forgetLink(link);
+      this.nodes.clear();
+      this.pager.fail(reason);
+    }
+
+    stop() {
+      this.observer.disconnect();
+      if (this.timer !== null) clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    destroy() {
+      this.disposed = true;
+      this.stop(); this.nodes.clear(); this.firstKeys.length = 0; this.restoredAt.length = 0;
+    }
+
+    recover() {
+      const pager = this.pager;
+      let container = pager.container;
+      if (!container.isConnected) {
+        const candidates = [...document.querySelectorAll(pager.rule.container)];
+        if (!candidates.length) return this.retry();
+        if (candidates.length !== 1) return this.block('网站重绘后匹配到多个内容容器，已停止，请刷新或调整规则。');
+        container = candidates[0];
+      }
+      const changed = container !== pager.container;
+      const missing = [...this.nodes].filter((node) => !node.isConnected);
+      // Ignore script recycling, transient removal/reinsertion, and unrelated DOM work.
+      if (!changed && !missing.length && pager.last.isConnected && [...this.nodes].every((node) => node.parentElement === container) && (!pager.spacer || pager.spacer.parentElement === container)) return this.complete();
+      if (changed && pager.removedPages) return this.block('已回收旧页后内容容器被重建，已停止，请刷新页面。');
+      const items = [...container.querySelectorAll(pager.rule.items)].filter((item) => !item.hasAttribute('data-vap-spacer'));
+      if (items.some((item) => item.parentElement !== container) || ['HTML', 'BODY'].includes(container.tagName)) return this.block('网站重绘后的条目结构已变化，已停止，请刷新或调整规则。');
+      const native = items.filter((item) => !this.nodes.has(item));
+      const expected = pager.removedPages ? [] : this.firstKeys;
+      if (expected.length && !native.length) return this.retry();
+      if (native.length !== expected.length || native.some((item, index) => itemKey(item, this.base) !== expected[index])) return this.block('网站重绘后列表内容已变化，未恢复旧内容，请刷新页面。');
+      const ordered = pager.pages.filter((page) => page.number > 1).flatMap((page) => page.nodes);
+      const attached = ordered.filter((node) => node.isConnected);
+      const selected = items.filter((item) => this.nodes.has(item));
+      if (attached.some((node, index) => node.parentElement !== container || selected[index] !== node) || selected.length !== attached.length) return this.block('网站已移动或重建追加条目，已停止以避免重复内容，请刷新页面。');
+      const now = performance.now();
+      this.restoredAt = this.restoredAt.filter((time) => now - time < 30000);
+      if ((changed || missing.length || (pager.spacer && pager.spacer.parentElement !== container)) && this.restoredAt.length >= 3) return this.block('网站在 30 秒内反复清除内容，已停止恢复，请刷新页面或关闭重绘兼容。');
+      this.observer.disconnect();
+      if (changed) {
+        pager.restoreItemLinks();
+        pager.openedMarks?.destroy(); pager.openedMarks = null;
+        pager.container = container;
+      }
+      // Restore only retained imported nodes, in their original order. Never cache
+      // or resurrect recycled pages and never replace the site's own children.
+      let before = null;
+      for (const node of [...ordered].reverse()) {
+        if (!node.isConnected) container.insertBefore(node, before);
+        before = node;
+      }
+      if (pager.spacer && pager.spacer.parentElement !== container) container.prepend(pager.spacer);
+      const first = pager.pages.find((page) => page.number === 1);
+      if (first) first.nodes = native;
+      for (const link of pager.originalLinkAttributes.keys()) if (!container.contains(link)) pager.restoreItemLink(link);
+      if (pager.openedMarks) for (const link of pager.openedMarks.links.keys()) if (!container.contains(link)) pager.openedMarks.forgetLink(link);
+      pager.last = ordered.at(-1) || native.at(-1);
+      // Rebind all links only after an actual redraw. Ordinary page loads remain incremental.
+      pager.syncItemLinks(items.concat(missing));
+      this.restoredAt.push(now);
+      pager.recoveryNote = `网站重绘后已恢复 ${missing.length} 个追加条目。`;
+      this.complete();
+    }
+
+    complete() {
+      this.attempts = 0;
+      this.observe();
+      if (this.recycleWasListening) this.pager.configureRecycling();
+      this.pager.notify(); this.pager.arm(); this.pager.scheduleRecycle();
+    }
+  }
+
   class Pager {
     constructor(rule) {
       this.rule = rule;
@@ -688,7 +844,7 @@
       this.itemClickHandler = (event) => this.openItemInBackground(event);
       this.itemClickListening = false;
       this.pageDownHandler = (event) => this.alignPageDown(event);
-      this.pages = rule.recyclePages ? [{ number: 1, nodes: [...items], keys: new Set(this.seenItems) }] : [];
+      this.pages = rule.recyclePages || rule.protectRepaint ? [{ number: 1, nodes: [...items], keys: new Set(this.seenItems) }] : [];
       this.discardedAnchors = new Set();
       this.removedPages = 0;
       this.spacer = null;
@@ -702,6 +858,8 @@
       this.originalListStart = this.container.localName === 'ol' ? this.container.getAttribute('start') : null;
       this.removedItems = 0;
       this.recycleHandler = () => this.scheduleRecycle();
+      this.recoveryNote = '';
+      this.recovery = rule.protectRepaint ? new ContentRecovery(this, items) : null;
       this.syncItemLinks(items);
       this.configureRecycling();
       this.configurePageDown();
@@ -809,7 +967,7 @@
       this.stopRecycling();
       this.recycleBlocked = false;
       this.recycleNote = '';
-      if (!this.rule.recyclePages || !this.rule.enabled || this.disposed) return;
+      if (!this.rule.recyclePages || !this.rule.enabled || this.disposed || this.recovery?.blocked || this.recovery?.pending) return;
       document.addEventListener('scroll', this.recycleHandler, { capture: true, passive: true });
       window.addEventListener('resize', this.recycleHandler, { passive: true });
       this.recycleListening = true;
@@ -967,6 +1125,7 @@
       if (picker && [picker.candidate, picker.hoverTarget, picker.pendingTarget, picker.selectorElement].some(includes)) cancelPicker();
       if (highlighted.some(({ el }) => includes(el))) clearHighlights();
       for (const page of retiring) {
+        page.nodes.forEach((node) => this.recovery?.nodes.delete(node));
         for (const node of page.nodes) {
           for (const el of [node, ...node.querySelectorAll('[id],a[name]')]) {
             if (el.id) this.discardedAnchors.add(el.id);
@@ -1068,6 +1227,8 @@
     arm() {
       this.observer?.disconnect();
       if (this.disposed || this.state !== 'idle' || this.busy) return;
+      if (this.recovery?.blocked || this.recovery?.pending) return;
+      if (this.recovery && (!this.container.isConnected || !this.last.isConnected)) return this.recovery.schedule();
       if (!this.container.isConnected || !this.last.isConnected) return this.fail('页面内容被重新渲染，请刷新或重新配置规则。');
       this.observer = new IntersectionObserver((entries) => {
         if (entries.some((entry) => entry.isIntersecting)) this.load(false);
@@ -1076,7 +1237,7 @@
     }
 
     resume() {
-      if (this.disposed || this.state === 'done' || needsRefresh) return;
+      if (this.disposed || this.state === 'done' || needsRefresh || this.recovery?.blocked) return;
       this.state = 'idle'; this.detail = '接近列表底部时加载下一页。'; this.notify(); this.arm();
     }
 
@@ -1096,6 +1257,7 @@
 
     destroy() {
       this.disposed = true; this.observer?.disconnect(); this.controller?.abort();
+      this.recovery?.destroy(); this.recovery = null;
       this.openedMarks?.destroy(); this.openedMarks = null;
       document.removeEventListener('keydown', this.pageDownHandler);
       this.stopRecycling(); this.restoreItemLinks();
@@ -1110,6 +1272,8 @@
 
     async load(manual = true) {
       if (this.busy || this.disposed || needsRefresh || this.state === 'done' || (!manual && this.state !== 'idle')) return;
+      if (this.recovery?.blocked || this.recovery?.pending) return;
+      if (this.recovery && (!this.container.isConnected || !this.last.isConnected)) return this.recovery.schedule();
       if (this.pageCount >= this.rule.maxPages) return this.finish(`已达到 ${this.rule.maxPages} 页上限。`);
       if (!this.next) return this.finish('已加载到最后一页。');
       if (this.seenPages.has(this.next)) return this.finish('下一页指向已加载页面，已停止。');
@@ -1139,7 +1303,12 @@
           nodes.push(document.importNode(prepareItem(item, base), true));
         }
         if (!nodes.length) return this.finish('下一页没有新的内容条目，已停止。');
-        if (controller.signal.aborted || this.disposed || !samePageRoute(this.route, location.href) || !this.container.isConnected) return;
+        if (controller.signal.aborted || this.disposed || !samePageRoute(this.route, location.href)) return;
+        if (!this.container.isConnected || this.recovery?.pending) {
+          this.state = automatic ? 'idle' : 'paused';
+          if (this.recovery) this.recovery.schedule(); else this.fail('页面内容被重新渲染，请刷新或重新配置规则。');
+          return;
+        }
         renameDuplicateIds(nodes, this.pageCount + 1);
         const fragment = document.createDocumentFragment();
         nodes.forEach((node) => fragment.append(node));
@@ -1149,7 +1318,8 @@
         this.seenPages.add(this.next); this.seenPages.add(result.url);
         pendingKeys.forEach((key) => this.seenItems.add(key));
         this.pageCount++;
-        if (this.rule.recyclePages) this.pages.push({ number: this.pageCount, nodes: [...nodes], keys: pendingKeys });
+        if (this.rule.recyclePages || this.rule.protectRepaint) this.pages.push({ number: this.pageCount, nodes: [...nodes], keys: pendingKeys });
+        if (this.recovery) nodes.forEach((node) => this.recovery.nodes.add(node));
         this.source = result.url; this.next = next;
         if (!next) this.finish('已加载到最后一页。');
         else if (this.seenPages.has(next)) this.finish('下一页指向已加载页面，已停止。');
@@ -1180,7 +1350,7 @@
   function renderStatus(pager = engine) {
     if (!ui || !host.isConnected || $('panel').hidden) return;
     setUIProperty('state', 'textContent', pager ? `${LABELS[pager.state]} · ${pager.pageCount} 页${pager.rule.recyclePages ? ` · 保留 ${pager.pages.length} 页` : ''}` : startupError ? '规则需要调整' : '尚未配置');
-    setUIProperty('status-detail', 'textContent', needsRefresh ? '新规则已保存，请刷新页面后应用。' : [pager?.detail || startupError || '配置后可自动追加下一页内容。', pager?.recycleNote].filter(Boolean).join('\n'));
+    setUIProperty('status-detail', 'textContent', needsRefresh ? '新规则已保存，请刷新页面后应用。' : [pager?.detail || startupError || '配置后可自动追加下一页内容。', pager?.recycleNote, pager?.recoveryNote].filter(Boolean).join('\n'));
     setUIProperty('toggle', 'disabled', !pager || pager.state === 'done' || needsRefresh);
     setUIProperty('toggle', 'textContent', !pager ? '开始自动加载' : ['idle', 'loading'].includes(pager.state) ? '暂停自动加载' : '继续自动加载');
     setUIProperty('load', 'disabled', !pager || pager.busy || pager.state === 'done' || needsRefresh);
@@ -1441,14 +1611,15 @@
   function applyRule(rule) {
     if (needsRefresh) { engine?.pause('请刷新后应用新规则。'); renderStatus(); return; }
     if (engine?.pageCount > 1) {
-      const same = ['origin', 'container', 'items', 'next', 'dedupe', 'recyclePages'].every((key) => engine.rule[key] === rule[key]);
+      const same = ['origin', 'container', 'items', 'next', 'dedupe', 'recyclePages', 'protectRepaint'].every((key) => engine.rule[key] === rule[key]);
       if (!same) {
-        engine.pause('规则已变更。'); needsRefresh = true; renderStatus(); return;
+        engine.pause('规则已变更。'); needsRefresh = true; engine.recovery?.stop(); renderStatus(); return;
       }
       engine.rule = rule;
       engine.syncItemLinks();
       engine.configureRecycling();
       engine.configurePageDown();
+      if (!rule.enabled || !wildcard(rule.path, location.pathname)) engine.recovery?.stop(); else engine.recovery?.observe();
       if (!rule.enabled || !rule.auto || !wildcard(rule.path, location.pathname)) engine.pause('规则已保存，自动加载已暂停。');
       else if (engine.state !== 'done') engine.resume();
       else engine.notify();
@@ -1531,7 +1702,7 @@
       const rules = [...merged.values()];
       GM_setValue(STORE, rules);
       updateActivation(rules);
-      engine?.pause('导入了新规则。'); needsRefresh = true;
+      engine?.pause('导入了新规则。'); needsRefresh = true; engine?.recovery?.stop();
       fillRule(matchingRule()); renderStatus(); message(`已导入 ${incoming.length} 条规则。刷新页面后应用。`);
     }));
 
