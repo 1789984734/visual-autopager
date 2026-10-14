@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         自动翻页 · 可视化规则
 // @namespace    local.visual-autopager
-// @version      1.8.1
+// @version      1.8.2
 // @description  多站点自动翻页：全站菜单入口、规则按需运行、配置界面延迟创建。
 // @homepageURL  https://github.com/1789984734/visual-autopager
 // @supportURL   https://github.com/1789984734/visual-autopager/issues
@@ -27,6 +27,8 @@
   const STORE = 'visual-autopager.rules.v1';
   const OPENED_TTL = 3 * 24 * 60 * 60 * 1000;
   const RECYCLE_INTERVAL = 200;
+  const INITIAL_QUIET = 800;
+  const INITIAL_LIMIT = 10000;
   const LABELS = { idle: '自动加载中', loading: '正在加载', paused: '已暂停', error: '加载失败', done: '已结束' };
   let engine = null;
   let needsRefresh = false;
@@ -114,7 +116,7 @@
           <p class="muted">从底部尚未完整显示的一排开始；适用于等高卡片网格。超高条目分段阅读。</p>
           <details><summary>加载设置</summary>
             <label class="check"><input id="protectRepaint" type="checkbox">兼容网站重绘（保护追加内容）</label>
-            <p class="muted">仅为出现内容闪现后消失的网站开启。列表被清空后尝试恢复追加条目；频繁重绘或内容变化时停止，并提示刷新。</p>
+            <p class="muted">首次翻页等待网页加载完成、列表稳定 800ms。后续重绘保护追加条目；频繁重绘或内容变化时停止，并提示刷新。</p>
             <label class="field"><span>Page Down 顶部避让</span><select id="pageDownOffsetMode"><option value="auto">自动识别顶部遮挡</option><option value="manual">手动指定高度</option></select></label>
             <label class="field"><span>Page Down 顶部预留高度（px）</span><input id="pageDownOffset" type="number" value="0" min="0" max="400" disabled><small class="muted">手动模式覆盖自动识别；填写 0 表示不预留。</small></label>
             <label class="field"><span>提前加载距离（px）</span><input id="preload" type="number" value="800" min="0" max="4000" step="100"></label>
@@ -676,6 +678,95 @@
     }
   }
 
+  class InitialRenderWait {
+    constructor(pager, ready, failed) {
+      this.pager = pager;
+      this.container = pager.container;
+      this.ready = ready;
+      this.failed = failed;
+      this.changedAt = performance.now();
+      this.deadline = this.changedAt + INITIAL_LIMIT;
+      this.timer = null;
+      this.settled = false;
+      this.promise = new Promise((resolve, reject) => { this.resolve = resolve; this.reject = reject; });
+      // The gate also runs for manual rules, which may have no active waiter.
+      this.promise.catch(() => {});
+      this.observer = new MutationObserver(() => { this.changedAt = performance.now(); this.queue(); });
+      this.observer.observe(this.container, { childList: true, subtree: true, characterData: true });
+      this.loadHandler = () => { this.changedAt = performance.now(); this.queue(); };
+      window.addEventListener('load', this.loadHandler, { once: true });
+      this.queue();
+    }
+
+    queue() {
+      if (this.settled) return;
+      if (this.timer !== null) clearTimeout(this.timer);
+      const now = performance.now();
+      const delay = document.readyState === 'complete' && this.container.isConnected ? Math.max(0, INITIAL_QUIET - (now - this.changedAt)) : this.deadline - now;
+      this.timer = setTimeout(() => { this.timer = null; this.check(); }, Math.max(0, Math.min(delay, this.deadline - now)));
+    }
+
+    check() {
+      if (this.settled) return;
+      if (this.pager.disposed || !this.pager.rule.enabled || needsRefresh || !samePageRoute(this.pager.route, location.href)) return this.cancel();
+      const now = performance.now();
+      if (now >= this.deadline) return this.finish(new Error('网页或列表等待超过 10 秒，已停止首次翻页，请页面加载完成后刷新重试。'));
+      if (!this.container.isConnected) {
+        const candidates = [...document.querySelectorAll(this.pager.rule.container)];
+        if (candidates.length > 1) return this.finish(new Error('首次渲染后匹配到多个内容容器，请调整规则。'));
+        if (candidates.length === 1) {
+          this.container = candidates[0];
+          this.observer.disconnect();
+          this.observer.observe(this.container, { childList: true, subtree: true, characterData: true });
+          this.changedAt = now;
+        } else {
+          if (this.timer !== null) clearTimeout(this.timer);
+          this.timer = setTimeout(() => { this.timer = null; this.check(); }, Math.min(150, this.deadline - now));
+          return;
+        }
+      }
+      if (document.readyState !== 'complete' || now - this.changedAt < INITIAL_QUIET) return this.queue();
+      if (!this.container.querySelector(this.pager.rule.items)) {
+        if (this.timer !== null) clearTimeout(this.timer);
+        this.timer = setTimeout(() => { this.timer = null; this.check(); }, Math.min(150, this.deadline - now));
+        return;
+      }
+      try {
+        const content = findContent(document, this.pager.rule);
+        if (content.container !== this.container) {
+          this.container = content.container; this.observer.disconnect();
+          this.observer.observe(this.container, { childList: true, subtree: true, characterData: true });
+          this.changedAt = now; return this.queue();
+        }
+        this.ready(content);
+        this.finish();
+      } catch (error) { this.finish(error); }
+    }
+
+    finish(error = null, cancelled = false) {
+      if (this.settled) return;
+      this.settled = true;
+      this.observer.disconnect();
+      window.removeEventListener('load', this.loadHandler);
+      if (this.timer !== null) clearTimeout(this.timer);
+      this.timer = null; this.container = null; this.ready = null;
+      if (error) { this.reject(error); if (!cancelled) this.failed(error); }
+      else this.resolve();
+      this.failed = null;
+    }
+
+    cancel() { this.finish(new DOMException('Aborted', 'AbortError'), true); }
+
+    wait(signal) {
+      return new Promise((resolve, reject) => {
+        const aborted = () => { signal.removeEventListener('abort', aborted); reject(new DOMException('Aborted', 'AbortError')); };
+        if (signal.aborted) return aborted();
+        signal.addEventListener('abort', aborted, { once: true });
+        this.promise.then(() => { signal.removeEventListener('abort', aborted); resolve(); }, (error) => { signal.removeEventListener('abort', aborted); reject(error); });
+      });
+    }
+  }
+
   class ContentRecovery {
     constructor(pager, items) {
       this.pager = pager;
@@ -687,12 +778,16 @@
       this.restoredAt = [];
       this.blocked = false;
       this.disposed = false;
+      this.initial = null;
+      this.initialPaused = false;
       this.observer = new MutationObserver((records) => {
         if (records.some((record) => [...record.removedNodes].some((node) => this.nodes.has(node) || node === pager.last || node === pager.spacer))) this.schedule();
       });
       if (items.some((item) => item.parentElement !== pager.container) || this.firstKeys.some((key) => !key)) {
         this.block('重绘兼容需要有内容签名的直接子条目，请调整容器与条目选择器。');
-      } else this.observe();
+      } else {
+        this.initial = new InitialRenderWait(pager, (content) => this.adoptInitial(content), (error) => this.block(error.message));
+      }
     }
 
     get pending() { return this.timer !== null; }
@@ -704,11 +799,39 @@
 
     observe() {
       this.observer.disconnect();
-      if (this.valid()) this.observer.observe(this.pager.container, { childList: true });
+      if (this.valid() && !this.initial) this.observer.observe(this.pager.container, { childList: true });
+    }
+
+    adoptInitial({ container, items }) {
+      const pager = this.pager;
+      const base = documentBase(document, canonical(location.href));
+      const keys = items.map((item) => itemKey(item, base));
+      if (items.some((item) => item.parentElement !== container) || keys.some((key) => !key)) throw new Error('首次渲染后的条目需为有内容签名的直接子元素，请调整规则。');
+      const next = findNext(document, pager.rule, canonical(location.href));
+      if (container !== pager.container) {
+        pager.restoreItemLinks(); pager.openedMarks?.destroy(); pager.openedMarks = null;
+        pager.container = container;
+        pager.originalListStart = container.localName === 'ol' ? container.getAttribute('start') : null;
+      }
+      this.initial = null; this.base = base; this.firstKeys = keys;
+      pager.last = items.at(-1);
+      pager.seenItems = new Set(keys);
+      pager.pages[0].nodes = [...items]; pager.pages[0].keys = new Set(keys);
+      pager.next = next;
+      pager.syncItemLinks();
+      this.observe();
+      if (!next) pager.finish('当前页没有下一页链接。');
+      else if (pager.state === 'done') {
+        pager.state = 'paused'; pager.detail = '列表已稳定，可开始翻页。';
+        if (pager.rule.auto && !this.initialPaused && !host?.isConnected) pager.resume();
+      }
+      else if (pager.state !== 'loading') pager.detail = pager.state === 'idle' ? '列表已稳定，接近底部时加载下一页。' : '列表已稳定，可继续手动加载。';
+      pager.notify(); pager.arm();
     }
 
     schedule() {
       if (!this.valid() || this.pending) return;
+      if (this.initial) return this.initial.check();
       this.pager.observer?.disconnect();
       this.recycleWasListening = this.pager.recycleListening;
       this.pager.stopRecycling();
@@ -752,6 +875,8 @@
 
     stop() {
       this.observer.disconnect();
+      this.initial?.cancel();
+      this.initial = null;
       if (this.timer !== null) clearTimeout(this.timer);
       this.timer = null;
     }
@@ -860,11 +985,12 @@
       this.recycleHandler = () => this.scheduleRecycle();
       this.recoveryNote = '';
       this.recovery = rule.protectRepaint ? new ContentRecovery(this, items) : null;
-      this.syncItemLinks(items);
+      if (this.recovery?.initial) this.detail = '等待网页加载完成及列表稳定后翻页。';
+      if (!this.recovery?.initial) this.syncItemLinks(items);
       this.configureRecycling();
       this.configurePageDown();
       this.notify();
-      if (rule.auto && this.next) this.resume();
+      if (rule.auto && (this.next || this.recovery?.initial)) this.resume();
     }
 
     notify() { if (!this.disposed) renderStatus(this); }
@@ -1237,12 +1363,14 @@
     }
 
     resume() {
-      if (this.disposed || this.state === 'done' || needsRefresh || this.recovery?.blocked) return;
-      this.state = 'idle'; this.detail = '接近列表底部时加载下一页。'; this.notify(); this.arm();
+      if (this.disposed || (this.state === 'done' && !this.recovery?.initial) || needsRefresh || this.recovery?.blocked) return;
+      if (this.recovery) this.recovery.initialPaused = false;
+      this.state = 'idle'; this.detail = this.recovery?.initial ? '等待网页加载完成及列表稳定后翻页。' : '接近列表底部时加载下一页。'; this.notify(); this.arm();
     }
 
     pause(detail = '点击继续，或手动加载下一页。') {
-      if (this.disposed || this.state === 'done') return;
+      if (this.disposed || (this.state === 'done' && !this.recovery?.initial)) return;
+      if (this.recovery) this.recovery.initialPaused = true;
       this.state = 'paused'; this.detail = detail;
       this.observer?.disconnect(); this.controller?.abort(); this.notify();
     }
@@ -1270,9 +1398,32 @@
       }
     }
 
+    async waitForInitial(manual) {
+      const initial = this.recovery.initial;
+      const automatic = this.state === 'idle';
+      const controller = new AbortController();
+      this.controller = controller; this.busy = true;
+      this.state = 'loading'; this.detail = '等待网页加载完成及列表稳定后加载下一页…'; this.observer?.disconnect(); this.notify();
+      let ready = false;
+      try {
+        await initial.wait(controller.signal);
+        ready = !controller.signal.aborted && !this.disposed && !needsRefresh && samePageRoute(this.route, location.href) && !this.recovery?.blocked;
+      } catch (error) {
+        if (!this.disposed && !controller.signal.aborted && error.name !== 'AbortError') this.fail(error.message);
+      } finally {
+        if (this.controller === controller) this.controller = null;
+        this.busy = false;
+      }
+      if (!ready || this.state === 'done') { this.notify(); return; }
+      this.state = automatic ? 'idle' : 'paused'; this.detail = '列表已稳定，可开始翻页。'; this.notify();
+      if (manual) return this.load(true);
+      this.arm();
+    }
+
     async load(manual = true) {
-      if (this.busy || this.disposed || needsRefresh || this.state === 'done' || (!manual && this.state !== 'idle')) return;
+      if (this.busy || this.disposed || needsRefresh || (this.state === 'done' && !this.recovery?.initial) || (!manual && this.state !== 'idle')) return;
       if (this.recovery?.blocked || this.recovery?.pending) return;
+      if (this.recovery?.initial) return this.waitForInitial(manual);
       if (this.recovery && (!this.container.isConnected || !this.last.isConnected)) return this.recovery.schedule();
       if (this.pageCount >= this.rule.maxPages) return this.finish(`已达到 ${this.rule.maxPages} 页上限。`);
       if (!this.next) return this.finish('已加载到最后一页。');
